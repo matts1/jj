@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::env;
 use std::env::split_paths;
 use std::fmt;
+use std::fs;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -36,6 +38,19 @@ use jj_lib::config::ConfigSource;
 use jj_lib::config::ConfigValue;
 use jj_lib::config::StackedConfig;
 use jj_lib::dsl_util;
+use jj_lib::file_util::IoResultExt as _;
+use jj_lib::file_util::PathError;
+use jj_lib::protos::user_config::UserConfig;
+use jj_lib::settings::UserSettings;
+use jj_lib::user_config::REPO_CONFIG_FILE;
+use jj_lib::user_config::UserConfigError;
+use jj_lib::user_config::UserConfigKey;
+use jj_lib::user_config::WORKSPACE_CONFIG_FILE;
+use jj_lib::user_config::read_user_config;
+use jj_lib::user_config::write_user_config;
+use rand_chacha::ChaCha20Rng;
+use rand_chacha::rand_core::RngCore as _;
+use rand_chacha::rand_core::SeedableRng as _;
 use regex::Captures;
 use regex::Regex;
 use serde::Serialize as _;
@@ -44,8 +59,14 @@ use tracing::instrument;
 use crate::command_error::CommandError;
 use crate::command_error::config_error;
 use crate::command_error::config_error_with_message;
+use crate::command_error::internal_error;
+use crate::command_error::internal_error_with_message;
+use crate::command_error::print_error_sources;
+use crate::command_error::user_error_with_hint;
+use crate::description_util::TextEditor;
 use crate::text_util;
 use crate::ui::Ui;
+use crate::ui::UiStdout;
 
 // TODO(#879): Consider generating entire schema dynamically vs. static file.
 pub const CONFIG_SCHEMA: &str = include_str!("config-schema.json");
@@ -367,6 +388,31 @@ impl UnresolvedConfigEnv {
     }
 }
 
+// Writes to a file with minimal read/write permissions.
+fn write_secret(path: &Path, content: &[u8]) -> Result<(), PathError> {
+    // Implementation copied from der::SecretDocument's write to file.
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut file| file.write_all(content))
+            .context(path)?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, content).context(path)?;
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct ConfigEnv {
     home_dir: Option<PathBuf>,
@@ -374,16 +420,43 @@ pub struct ConfigEnv {
     workspace_path: Option<PathBuf>,
     user_config_paths: Vec<ConfigPath>,
     repo_config_path: Option<ConfigPath>,
+    repo_user_config: Option<UserConfig>,
     workspace_config_path: Option<ConfigPath>,
     command: Option<String>,
+    signing_key: Option<UserConfigKey>,
+}
+
+fn load_key(path: &Path) -> Result<UserConfigKey, CommandError> {
+    Ok(match std::fs::read(path) {
+        Ok(bytes) => *UserConfigKey::from_slice(&bytes),
+        // Create the key if it doesn't exist.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let key_dir = path.parent().unwrap();
+            fs::create_dir_all(key_dir).context(key_dir)?;
+
+            let mut key = UserConfigKey::default();
+            // ChaCha20Rng is marked as CryptoRng, so should be more secure to generate
+            // private keys.
+            ChaCha20Rng::from_os_rng().fill_bytes(&mut key);
+            let key = key.as_slice();
+
+            write_secret(path, key)?;
+            *UserConfigKey::from_slice(key)
+        }
+        Err(e) => {
+            return Err(internal_error_with_message(
+                format!("Failed to read jj key from {path:?}"),
+                e,
+            ));
+        }
+    })
 }
 
 impl ConfigEnv {
     /// Initializes configuration loader based on environment variables.
-    pub fn from_environment(ui: &Ui) -> Self {
-        let config_dir = etcetera::choose_base_strategy()
-            .ok()
-            .map(|s| s.config_dir());
+    pub fn from_environment(ui: &Ui) -> Result<Self, CommandError> {
+        let strategy = etcetera::choose_base_strategy().ok();
+        let config_dir = strategy.as_ref().map(|s| s.config_dir());
 
         // older versions of jj used a more "GUI" config option,
         // which is not designed for user-editable configuration of CLI utilities.
@@ -409,21 +482,35 @@ impl ConfigEnv {
             .ok()
             .map(|d| dunce::canonicalize(&d).unwrap_or(d));
 
+        let key = if let Some(strategy) = &strategy {
+            Some(load_key(
+                &strategy.data_dir().join("jj/config/keys/hmac-sha256-key"),
+            )?)
+        } else {
+            None
+        };
+
         let env = UnresolvedConfigEnv {
             config_dir,
             macos_legacy_config_dir,
             home_dir: home_dir.clone(),
             jj_config: env::var("JJ_CONFIG").ok(),
         };
-        Self {
+        Ok(Self {
             home_dir,
             repo_path: None,
             workspace_path: None,
             user_config_paths: env.resolve(ui),
             repo_config_path: None,
+            repo_user_config: None,
             workspace_config_path: None,
             command: None,
-        }
+            signing_key: key,
+        })
+    }
+
+    pub fn signing_key(&self) -> Option<&UserConfigKey> {
+        self.signing_key.as_ref()
     }
 
     pub fn set_command_name(&mut self, command: String) {
@@ -488,11 +575,171 @@ impl ConfigEnv {
         Ok(())
     }
 
+    pub fn edit_config_file(
+        &self,
+        ui: &Ui,
+        editor: &TextEditor,
+        file: &ConfigFile,
+        to_write: Option<(&str, UserConfig)>,
+    ) -> Result<(), CommandError> {
+        // Editing again and again until either of these conditions is met
+        // 1. The config is OK
+        // 2. The user restores previous one
+        writeln!(ui.status(), "Editing file: {}", file.path().display())?;
+        loop {
+            editor.edit_file(file.path())?;
+
+            // Trying to load back config. If error, prompt to continue editing
+            if let Err(e) =
+                ConfigLayer::load_from_file(file.layer().source, file.path().to_path_buf())
+            {
+                writeln!(
+                    ui.warning_default(),
+                    "An error has been found inside the config:"
+                )?;
+                print_error_sources(ui, Some(&e))?;
+                let continue_editing = ui.prompt_yes_no(
+                    "Do you want to keep editing the file? If not, previous config will be \
+                     restored.",
+                    Some(true),
+                )?;
+                if !continue_editing {
+                    // Saving back previous config
+                    file.save()?;
+                    break;
+                }
+            } else {
+                // config is OK. So we now record the config as having come from
+                // the user in case it wasn't previously.
+                if let Some((name, to_write)) = to_write {
+                    let secure_config = file.path().parent().unwrap().join(name);
+                    write_user_config(&secure_config, &to_write, self.signing_key())
+                        .map_err(internal_error)?;
+                }
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn repo_user_config(&self) -> Option<&UserConfig> {
+        self.repo_user_config.as_ref()
+    }
+
+    fn load_user_config(
+        &self,
+        ui: &Ui,
+        kind: &str,
+        secure_config: &Path,
+        config_file: &Path,
+        raw_config: &RawConfig,
+    ) -> Result<UserConfig, CommandError> {
+        let trust_config = |config: UserConfig| {
+            write_user_config(secure_config, &config, self.signing_key())
+                .map_err(|e| internal_error_with_message("Failed to add secure config", e))?;
+            Ok(config)
+        };
+        let (want_config, msg) = match read_user_config(secure_config, self.signing_key()) {
+            Err(UserConfigError::NotFound) => {
+                if !config_file.exists() {
+                    return trust_config(Default::default());
+                }
+                // Provide a grace period for which repos without secure user config
+                // information will be automatically migrated to add it.
+                // If we did not provide this grace period, repo configs would be
+                // disabled for every repo created by an older version of jj.
+                // TODO: After the grace period is over (~jj 0.47), make this act the
+                // same as InvalidSignature or RepoMovedError.
+                return trust_config(Default::default());
+            }
+            Err(UserConfigError::RepoMoved { from, to, config }) => {
+                if !config_file.exists() && config == Default::default() {
+                    return trust_config(config);
+                }
+                (
+                    config,
+                    format!(
+                        "The {kind} has moved from {from} to {to}. For security reasons, we don't \
+                         trust your {kind} config"
+                    ),
+                )
+            }
+            Err(UserConfigError::InvalidSignature(config)) => {
+                if !config_file.exists() && config == Default::default() {
+                    return trust_config(config);
+                }
+                (
+                    config,
+                    format!(
+                        "The {kind} appears to have been created by someone else. For security \
+                         reasons, we don't trust your {kind} config"
+                    ),
+                )
+            }
+            other => return other.map_err(internal_error),
+        };
+
+        if !Ui::can_prompt() || matches!(ui.stdout(), UiStdout::Null(_)) {
+            // If we're not in an interactive terminal, then we just throw an error.
+            // As of now, it's unclear what kind of workflows will trigger this.
+            // In the future, as we learn more about this, we may consider
+            // disabling the repo config instead.
+            return Err(user_error_with_hint(
+                msg,
+                format!("Run `jj config edit --{kind}` to review and re-enable"),
+            ));
+        }
+
+        writeln!(ui.warning_default(), "{msg}")?;
+        match ui.prompt_choice(
+            // If this feature annoys users, we can, in the future, add an
+            // option to disable this feature entirely.
+            // However, I think this should be sufficiently nice UX, as this
+            // now requires two keystrokes.
+            r#"There are several things you can do with this config:
+  (r): Review the config and make any changes required to make it safe
+  (t): Trust the config
+  (d): Delete the config
+Please select an option"#,
+            &["r", "t", "d"],
+            Some(0),
+        )? {
+            0 => {
+                let (file, source) = match kind {
+                    "repo" => (REPO_CONFIG_FILE, ConfigSource::Repo),
+                    "workspace" => (WORKSPACE_CONFIG_FILE, ConfigSource::Workspace),
+                    _ => unreachable!(),
+                };
+                self.edit_config_file(
+                    ui,
+                    &TextEditor::from_settings(&UserSettings::from_config(
+                        self.resolve_config(raw_config)?,
+                    )?)?,
+                    &ConfigFile::load_or_empty(source, config_file)?,
+                    Some((file, Default::default())),
+                )?;
+                Ok(Default::default())
+            }
+            1 => trust_config(want_config),
+            2 => {
+                std::fs::write(config_file, "").context(config_file)?;
+                Ok(Default::default())
+            }
+            _ => unreachable!(),
+        }
+    }
+
     /// Sets the directory where repo-specific config file is stored. The path
     /// is usually `.jj/repo`.
     pub fn reset_repo_path(&mut self, path: &Path) {
         self.repo_path = Some(path.to_owned());
-        self.repo_config_path = Some(ConfigPath::new(path.join("config.toml")));
+        let new_path = path.join("config.toml");
+        if let Some(old_path) = &self.repo_config_path
+            && old_path.as_path() != new_path
+        {
+            self.repo_user_config = None;
+        }
+        self.repo_config_path = Some(ConfigPath::new(new_path));
     }
 
     /// Returns a path to the repo-specific config file.
@@ -531,9 +778,24 @@ impl ConfigEnv {
 
     /// Loads repo-specific config file into the given `config`. The old
     /// repo-config layer will be replaced if any.
-    #[instrument]
-    pub fn reload_repo_config(&self, config: &mut RawConfig) -> Result<(), ConfigLoadError> {
+    #[instrument(skip(ui))]
+    pub fn reload_repo_config(
+        &mut self,
+        ui: &Ui,
+        config: &mut RawConfig,
+    ) -> Result<(), CommandError> {
         config.as_mut().remove_layers(ConfigSource::Repo);
+        if self.repo_user_config.is_none()
+            && let Some(path) = self.repo_config_path()
+        {
+            self.repo_user_config = Some(self.load_user_config(
+                ui,
+                "repo",
+                &path.parent().unwrap().join(REPO_CONFIG_FILE),
+                path,
+                config,
+            )?);
+        }
         if let Some(path) = self.existing_repo_config_path() {
             config.as_mut().load_file(ConfigSource::Repo, path)?;
         }
@@ -585,9 +847,23 @@ impl ConfigEnv {
 
     /// Loads workspace-specific config file into the given `config`. The old
     /// workspace-config layer will be replaced if any.
-    #[instrument]
-    pub fn reload_workspace_config(&self, config: &mut RawConfig) -> Result<(), ConfigLoadError> {
+    #[instrument(skip(ui))]
+    pub fn reload_workspace_config(
+        &self,
+        ui: &Ui,
+        config: &mut RawConfig,
+    ) -> Result<(), CommandError> {
         config.as_mut().remove_layers(ConfigSource::Workspace);
+
+        if let Some(path) = self.workspace_config_path() {
+            self.load_user_config(
+                ui,
+                "workspace",
+                &path.parent().unwrap().join(WORKSPACE_CONFIG_FILE),
+                path,
+                config,
+            )?;
+        }
         if let Some(path) = self.existing_workspace_config_path() {
             config.as_mut().load_file(ConfigSource::Workspace, path)?;
         }
@@ -1850,8 +2126,10 @@ mod tests {
             workspace_path: None,
             user_config_paths: env.resolve(&Ui::null()),
             repo_config_path: None,
+            repo_user_config: None,
             workspace_config_path: None,
             command: None,
+            signing_key: None,
         }
     }
 }

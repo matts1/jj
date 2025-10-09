@@ -361,10 +361,13 @@ impl CommandHelper {
         let mut config_env = self.data.config_env.clone();
         let mut raw_config = self.data.raw_config.clone();
         let repo_path = workspace_root.join(".jj").join("repo");
+        // The workspace should never have the incorrect signature at this
+        // point.
+        let ui = Ui::null();
         config_env.reset_repo_path(&repo_path);
-        config_env.reload_repo_config(&mut raw_config)?;
+        config_env.reload_repo_config(&ui, &mut raw_config)?;
         config_env.reset_workspace_path(workspace_root);
-        config_env.reload_workspace_config(&mut raw_config)?;
+        config_env.reload_workspace_config(&ui, &mut raw_config)?;
         let mut config = config_env.resolve_config(&raw_config)?;
         // No migration messages here, which would usually be emitted before.
         jj_lib::config::migrate(&mut config, &self.data.config_migrations)?;
@@ -3861,7 +3864,7 @@ impl<'a> CliRunner<'a> {
                      accessed?",
                 )
             })?;
-        let mut config_env = ConfigEnv::from_environment(ui);
+        let mut config_env = ConfigEnv::from_environment(ui)?;
         let mut last_config_migration_descriptions = Vec::new();
         let mut migrate_config = |config: &mut StackedConfig| -> Result<(), CommandError> {
             last_config_migration_descriptions =
@@ -3879,11 +3882,45 @@ impl<'a> CliRunner<'a> {
             .create(find_workspace_dir(&cwd))
             .map_err(|err| map_workspace_load_error(err, Some(".")));
         config_env.reload_user_config(&mut raw_config)?;
+
+        // In case the user has done something like aliasing `jj ce` to
+        // `jj config edit`.
+        let initial_args = to_string_args(env::args_os())?;
+        let initial_args = resolve_aliases(
+            &Ui::null(),
+            &config_env.resolve_config(&raw_config)?,
+            &self.app,
+            initial_args.clone(),
+        )
+        .ok()
+        .unwrap_or(initial_args);
+        // If in-repo config is marked as insecure, reload_repo/workspace_config
+        // will return an error telling you to run `jj config edit`.
+        // Hence, `jj config edit` needs to be able to run even when reloading
+        // the config would return an error.
+        let allow_in_repo_config = if let Ok(m) =
+            self.app.clone().try_get_matches_from(&initial_args)
+            && let Some((name, subcmd)) = m.subcommand()
+            // I'm tempted to apply this to the whole of `jj config`, since
+            // none of the other config subcommands should be repo-specific
+            // either.
+            && name == "config"
+            && subcmd.subcommand_name() == Some("edit")
+        {
+            false
+        } else {
+            true
+        };
+
         if let Ok(loader) = &maybe_cwd_workspace_loader {
             config_env.reset_repo_path(loader.repo_path());
-            config_env.reload_repo_config(&mut raw_config)?;
+            if allow_in_repo_config {
+                config_env.reload_repo_config(ui, &mut raw_config)?;
+            }
             config_env.reset_workspace_path(loader.workspace_root());
-            config_env.reload_workspace_config(&mut raw_config)?;
+            if allow_in_repo_config {
+                config_env.reload_workspace_config(ui, &mut raw_config)?;
+            }
         }
         let mut config = config_env.resolve_config(&raw_config)?;
         migrate_config(&mut config)?;
@@ -3927,9 +3964,13 @@ impl<'a> CliRunner<'a> {
                 .create(&abs_path)
                 .map_err(|err| map_workspace_load_error(err, Some(path)))?;
             config_env.reset_repo_path(loader.repo_path());
-            config_env.reload_repo_config(&mut raw_config)?;
+            if allow_in_repo_config {
+                config_env.reload_repo_config(ui, &mut raw_config)?;
+            }
             config_env.reset_workspace_path(loader.workspace_root());
-            config_env.reload_workspace_config(&mut raw_config)?;
+            if allow_in_repo_config {
+                config_env.reload_workspace_config(ui, &mut raw_config)?;
+            }
             Ok(loader)
         } else {
             maybe_cwd_workspace_loader
