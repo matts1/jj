@@ -516,29 +516,30 @@ pub async fn cmd_gerrit_upload(
 
         // The user can choose to explicitly set their own change-ID to
         // override the default change-ID based on the jj change-ID.
-        let new_description = if let Some(trailer) = change_id_trailers.first() {
+        let (new_description, gerrit_change_id) = if let Some(trailer) = change_id_trailers.first() {
             // Check the change-id format is correct, intentionally leave the
             // invalid change IDs as-is.
-            if trailer.key == "Change-Id"
-                && (trailer.value.len() != 41 || !trailer.value.starts_with('I'))
-            {
-                writeln!(
-                    ui.warning_default(),
-                    "Invalid Change-Id footer in revision {}",
-                    short_change_hash(original_commit.change_id()),
-                )?;
-            }
-            if trailer.key == "Link"
-                && !matches!(trailer.value.split_once("/id/I"), Some((_url, id)) if id.len() == 40)
-            {
-                writeln!(
-                    ui.warning_default(),
-                    "Invalid Link footer in revision {}",
-                    short_change_hash(original_commit.change_id()),
-                )?;
-            }
-
-            original_commit.description().to_owned()
+            (original_commit.description().to_owned(), if trailer.key == "Change-Id" {
+                if trailer.value.len() != 41 || !trailer.value.starts_with('I') {
+                    return Err(user_error(format!(
+                        "Invalid Change-Id footer in revision {}",
+                        short_change_hash(original_commit.change_id()),
+                    )));
+                }
+                trailer.value.to_owned()
+            } else {
+                match trailer.value.split_once("/id/I") {
+                    Some((_url, id)) if id.len() == 40 => {
+                        format!("I{id}")
+                    }
+                    _ => {
+                        return Err(user_error(format!(
+                            "Invalid Link footer in revision {}",
+                            short_change_hash(original_commit.change_id()),
+                        )));
+                    }
+                }
+            })
         } else {
             // Gerrit change id is 40 chars, jj change id is 32, so we need padding.
             // To be consistent with `format_gerrit_change_id_trailer``, we pad with
@@ -555,12 +556,12 @@ pub async fn cmd_gerrit_upload(
                     format!("Change-Id: {gerrit_change_id}")
                 };
 
-            format!(
+            (format!(
                 "{}{}{}\n",
                 original_commit.description().trim(),
                 if trailers.is_empty() { "\n\n" } else { "\n" },
                 change_id_trailer,
-            )
+            ), gerrit_change_id)
         };
 
         let new_parents = original_commit
@@ -568,9 +569,13 @@ pub async fn cmd_gerrit_upload(
             .iter()
             .map(|id| old_to_new.get(id).map_or(id, |p| p.id()).clone())
             .collect();
+        // TODO: remove
+        let new_description = original_commit.description();
 
         if new_description == original_commit.description()
             && new_parents == original_commit.parent_ids()
+            && original_commit.get_extra_header("Change-Id") == Some(gerrit_change_id.as_str())
+            && original_commit.get_extra_header("Gerrit-branch") == Some(remote_branch.as_str())
         {
             // map the old commit to itself
             old_to_new.insert(original_commit.id().clone(), original_commit);
@@ -583,6 +588,11 @@ pub async fn cmd_gerrit_upload(
             .repo_mut()
             .rewrite_commit(&original_commit)
             .set_description(new_description)
+            // This allows us to identify which commits have been uploaded to gerrit, and what branch they were uploaded to.
+            .add_extra_header("Change-Id", gerrit_change_id)
+            // This does have the side effect of changing the commit hash when you change the branch you push to, but that
+            // should be a pretty uncommon workflow and the consequences aren't particularly bad.
+            .add_extra_header("Gerrit-branch", remote_branch.clone())
             .set_parents(new_parents)
             // Set the timestamp back to the timestamp of the original commit.
             // Otherwise, `jj gerrit upload @ && jj gerrit upload @` will upload

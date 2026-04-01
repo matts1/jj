@@ -136,6 +136,11 @@ impl CommitBuilder<'_> {
         self
     }
 
+    pub fn add_extra_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.inner.add_extra_header(key, value);
+        self
+    }
+
     /// [`Commit::is_discardable()`] for the new commit.
     pub async fn is_discardable(&self) -> BackendResult<bool> {
         self.inner.is_discardable(self.mut_repo).await
@@ -207,6 +212,7 @@ impl DetachedCommitBuilder {
             author: signature.clone(),
             committer: signature,
             secure_sig: None,
+            extra_headers: vec![],
         };
         let record_predecessors_in_commit = settings
             .get_bool("experimental.record-predecessors-in-commit")
@@ -367,6 +373,11 @@ impl DetachedCommitBuilder {
 
     pub fn set_committer(&mut self, committer: Signature) -> &mut Self {
         self.commit.committer = committer;
+        self
+    }
+
+    pub fn add_extra_header(&mut self, key: impl Into<String>, value: impl Into<String>) -> &mut Self {
+        self.commit.extra_headers.push((key.into(), value.into()));
         self
     }
 

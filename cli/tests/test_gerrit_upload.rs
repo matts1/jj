@@ -331,8 +331,8 @@ fn test_gerrit_upload_local_implicit_change_ids() {
     // There's no particular reason to run this with jj util exec, it's just that
     // the infra makes it easier to run this way.
     let output = remote_dir.run_jj(["util", "exec", "--", "git", "log", "refs/for/main"]);
-    insta::assert_snapshot!(output, @"
-    commit 68b986d2eb820643b767ae219fb48128dcc2fc03
+    insta::assert_snapshot!(output, @r"
+    commit 7067bd4a39285a282004f7e054f4a01d21438a9c
     Author: Test User <test.user@example.com>
     Date:   Sat Feb 3 04:05:13 2001 +0700
 
@@ -341,7 +341,7 @@ fn test_gerrit_upload_local_implicit_change_ids() {
         Signed-off-by: Lucky K Maintainer <lucky@maintainer.example.org>
         Change-Id: I19b790168e73f7a73a98deae21e807c06a6a6964
 
-    commit 81b723522d1c1a583a045eab5bfb323e45e6198d
+    commit 140d154495f85f2e7b5b436fab024474d3d43258
     Author: Test User <test.user@example.com>
     Date:   Sat Feb 3 04:05:11 2001 +0700
 
@@ -430,7 +430,7 @@ review-url = "https://gerrit.example.com/"
     // the infra makes it easier to run this way.
     let output = remote_dir.run_jj(["util", "exec", "--", "git", "log", "refs/for/main"]);
     insta::assert_snapshot!(output, @r"
-    commit b2731737e530be944c12679a86dacca2a3d3c6ad
+    commit 8bc3469d746c88cf360f9b9dca9a48bdf7e531e0
     Author: Test User <test.user@example.com>
     Date:   Sat Feb 3 04:05:13 2001 +0700
 
@@ -439,7 +439,7 @@ review-url = "https://gerrit.example.com/"
         Signed-off-by: Lucky K Maintainer <lucky@maintainer.example.org>
         Link: https://gerrit.example.com/id/I19b790168e73f7a73a98deae21e807c06a6a6964
 
-    commit 9bc0339b54de4f3bcf241f8d68daf75bd6501cff
+    commit 176eed82bb7e01d00a867f3e611f56010932e627
     Author: Test User <test.user@example.com>
     Date:   Sat Feb 3 04:05:11 2001 +0700
 
@@ -539,29 +539,15 @@ fn test_gerrit_upload_local_explicit_change_ids() {
 
     // There's no particular reason to run this with jj util exec, it's just that
     // the infra makes it easier to run this way.
-    let output = remote_dir.run_jj(["util", "exec", "--", "git", "log", "refs/for/main"]);
-    insta::assert_snapshot!(output, @"
-    commit b4124fc9d4694eecb4d9938cf4874cd13f1252b6
-    Author: Test User <test.user@example.com>
-    Date:   Sat Feb 3 04:05:14 2001 +0700
+    let output = remote_dir.run_jj(["util", "exec", "--", "git", "cat-file", "-p", "refs/for/main"]);
+    insta::assert_snapshot!(output, @r"
+    tree 04a59185a0c5f4047e4fd3fa87b0c84e671b00ee
+    parent 6ba637a063b9f71e86280634bd5517909ea37fce
+    author Test User <test.user@example.com> 981147914 +0700
+    committer Test User <test.user@example.com> 981147916 +0700
+    Change-Id Idfac1e8c149efddf5c7a286f787b43886a6a6964
 
-        c
-        
-        Link: https://gerrit.example.com/id/Idfac1e8c149efddf5c7a286f787b43886a6a6964
-
-    commit 887a7016ec03a904835da1059543d8cc34b6ba76
-    Author: Test User <test.user@example.com>
-    Date:   Sat Feb 3 04:05:11 2001 +0700
-
-        b
-        
-        Change-Id: Id39b308212fe7e0b746d16c13355f3a90712d7f9
-
-    commit 7d980be7a1d499e4d316ab4c01242885032f7eaf
-    Author: Test User <test.user@example.com>
-    Date:   Sat Feb 3 04:05:08 2001 +0700
-
-        a
+    c
     [EOF]
     ");
 }
@@ -635,8 +621,8 @@ fn test_gerrit_upload_local_mixed_change_ids() {
     // There's no particular reason to run this with jj util exec, it's just that
     // the infra makes it easier to run this way.
     let output = remote_dir.run_jj(["util", "exec", "--", "git", "log", "refs/for/main"]);
-    insta::assert_snapshot!(output, @"
-    commit 015df2b1d38bdc71ae7ef24c2889100e39d34ef8
+    insta::assert_snapshot!(output, @r"
+    commit a57980a5874c158484cd9114b5f7325e34256c6a
     Author: Test User <test.user@example.com>
     Date:   Sat Feb 3 04:05:13 2001 +0700
 
@@ -644,7 +630,7 @@ fn test_gerrit_upload_local_mixed_change_ids() {
         
         Change-Id: Id39b308212fe7e0b746d16c13355f3a90712d7f9
 
-    commit 81b723522d1c1a583a045eab5bfb323e45e6198d
+    commit 140d154495f85f2e7b5b436fab024474d3d43258
     Author: Test User <test.user@example.com>
     Date:   Sat Feb 3 04:05:11 2001 +0700
 
@@ -763,15 +749,11 @@ fn test_gerrit_upload_bad_change_ids() {
 
     // check both badly and slightly malformed Change-Id / Link trailers
     let output = local_dir.run_jj(["gerrit", "upload", "-rb4", "--remote-branch=main"]);
-    insta::assert_snapshot!(output, @"
+    insta::assert_snapshot!(output, @r"
     ------- stderr -------
-    Warning: Invalid Change-Id footer in revision mzvwutvlkqwt
-    Warning: Invalid Change-Id footer in revision yqosqzytrlsw
-    Warning: Invalid Link footer in revision yostqsxwqrlt
-    Warning: Invalid Link footer in revision kpqxywonksrl
-    Found 1 heads to push to Gerrit (remote 'origin'), target branch 'main'
-    Pushing kpqxywon 69536ef3 b4
+    Error: Invalid Change-Id footer in revision mzvwutvlkqwt
     [EOF]
+    [exit status: 1]
     ");
 }
 

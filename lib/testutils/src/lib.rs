@@ -682,6 +682,7 @@ pub fn commit_with_tree(store: &Arc<Store>, tree: MergedTree) -> Commit {
         author: signature.clone(),
         committer: signature,
         secure_sig: None,
+        extra_headers: vec![],
     };
     store.write_commit(commit, None).block_on().unwrap()
 }

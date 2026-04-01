@@ -627,19 +627,34 @@ fn commit_from_git_without_root_parent(
     // us the sogned data, only the signature.
     // Ideally, we could use try_to_commit_ref_iter at the beginning of this
     // function and extract everything from that. For now, this works
-    let secure_sig = commit
-        .extra_headers
-        .iter()
-        // gix does not recognize gpgsig-sha256, but prevent future footguns by checking for it too
-        .any(|(k, _)| *k == "gpgsig" || *k == "gpgsig-sha256")
-        .then(|| CommitRefIter::signature(&git_object.data))
-        .transpose()
-        .map_err(decode_err)?
-        .flatten()
-        .map(|(sig, data)| SecureSig {
-            data: data.to_bstring().into(),
-            sig: sig.into_owned().into(),
-        });
+    let mut extra_headers = vec![];
+    let mut is_signed = false;
+    for (k, v) in &commit.extra_headers {
+        let k_str = String::from_utf8_lossy(k).into_owned();
+        if k_str == "gpgsig" || k_str == "gpgsig-sha256" {
+            is_signed = true;
+            continue;
+        }
+        if k_str == JJ_TREES_COMMIT_HEADER
+            || k_str == JJ_CONFLICT_LABELS_COMMIT_HEADER
+            || k_str == CHANGE_ID_COMMIT_HEADER
+        {
+            continue;
+        }
+        let v_str = String::from_utf8_lossy(v).into_owned();
+        extra_headers.push((k_str, v_str));
+    }
+
+    let secure_sig = if is_signed {
+        CommitRefIter::signature(&git_object.data)
+            .map_err(decode_err)?
+            .map(|(sig, data)| SecureSig {
+                data: data.to_bstring().into(),
+                sig: sig.into_owned().into(),
+            })
+    } else {
+        None
+    };
 
     Ok(Commit {
         parents,
@@ -652,6 +667,7 @@ fn commit_from_git_without_root_parent(
         author,
         committer,
         secure_sig,
+        extra_headers,
     })
 }
 
@@ -1291,6 +1307,10 @@ impl Backend for GitBackend {
                 CHANGE_ID_COMMIT_HEADER.into(),
                 contents.change_id.reverse_hex().into(),
             ));
+        }
+
+        for (k, v) in &contents.extra_headers {
+            extra_headers.push((k.as_str().into(), v.as_str().into()));
         }
 
         if tree_ids.iter().any(|id| id == &self.empty_tree_id) {
@@ -1948,6 +1968,7 @@ mod tests {
             author: create_signature(),
             committer: create_signature(),
             secure_sig: None,
+            extra_headers: vec![],
         };
 
         let (initial_commit_id, _init_commit) = backend.write_commit(commit, None).block_on()?;
@@ -2039,6 +2060,7 @@ mod tests {
             author: create_signature(),
             committer: create_signature(),
             secure_sig: None,
+            extra_headers: vec![],
         };
 
         let write_commit = |commit: Commit| -> BackendResult<(CommitId, Commit)> {
@@ -2127,6 +2149,7 @@ mod tests {
             author: create_signature(),
             committer: create_signature(),
             secure_sig: None,
+            extra_headers: vec![],
         };
 
         let write_commit = |commit: Commit| -> BackendResult<(CommitId, Commit)> {
@@ -2232,6 +2255,7 @@ mod tests {
             author: signature.clone(),
             committer: signature,
             secure_sig: None,
+            extra_headers: vec![],
         };
         let commit_id = backend.write_commit(commit, None).block_on()?.0;
         let git_refs = git_repo.references()?;
@@ -2307,6 +2331,7 @@ mod tests {
             author: create_signature(),
             committer: create_signature(),
             secure_sig: None,
+            extra_headers: vec![],
         };
 
         let write_commit = |commit: Commit| -> BackendResult<(CommitId, Commit)> {
@@ -2348,6 +2373,7 @@ mod tests {
             author: create_signature(),
             committer: create_signature(),
             secure_sig: None,
+            extra_headers: vec![],
         };
 
         let mut signer = |data: &_| {

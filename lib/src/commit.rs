@@ -166,6 +166,14 @@ impl Commit {
         &self.data.description
     }
 
+    pub fn get_extra_header(&self, key: &str) -> Option<&str> {
+        self.data
+            .extra_headers
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
     pub fn author(&self) -> &Signature {
         &self.data.author
     }

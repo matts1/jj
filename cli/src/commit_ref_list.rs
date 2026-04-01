@@ -320,6 +320,7 @@ mod tests {
             author,
             committer,
             secure_sig: None,
+            extra_headers: vec![],
         })
     }
 

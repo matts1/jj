@@ -215,6 +215,8 @@ pub struct Commit {
     /// A cryptographic signature of this commit.
     #[serde(skip)] // raw data wouldn't be useful
     pub secure_sig: Option<SecureSig>,
+    /// Generic extra headers for the commit (e.g., Gerrit branch and change ID).
+    pub extra_headers: Vec<(String, String)>,
 }
 
 /// An individual copy event, from file A -> B.
@@ -530,6 +532,7 @@ pub fn make_root_commit(root_change_id: ChangeId, empty_tree_id: TreeId) -> Comm
         author: signature.clone(),
         committer: signature,
         secure_sig: None,
+        extra_headers: vec![],
     }
 }
 
